@@ -376,10 +376,10 @@ html,body{font-family:'Inter',sans-serif;background:#fff;color:#0a0a0a;-webkit-f
       <!-- Date bar -->
       <div class="date-bar">
         <span class="date-bar-label">Range</span>
-        <button class="date-chip active" id="chip-7"   onclick="setRangeDays(7,this)">Last 7 days</button>
+        <button class="date-chip" id="chip-7" onclick="setRangeDays(7,this)">Last 7 days</button>
         <button class="date-chip"        id="chip-30"  onclick="setRangeDays(30,this)">Last 30 days</button>
         <button class="date-chip"        id="chip-90"  onclick="setRangeDays(90,this)">Last 90 days</button>
-        <button class="date-chip"        id="chip-all" onclick="setRangeDays(0,this)">All time</button>
+        <button class="date-chip active" id="chip-all" onclick="setRangeDays(0,this)">All time</button>
         <div class="date-divider"></div>
         <div class="custom-dates">
           <input type="date" class="date-in" id="range-from" onchange="applyCustomRange()"/>
@@ -760,18 +760,12 @@ html,body{font-family:'Inter',sans-serif;background:#fff;color:#0a0a0a;-webkit-f
     try { showScreen('overview'); } catch (e) { console.error('[WL showScreen]', e); }
 
     try {
-      const now = new Date();
-      const d7  = new Date(now); d7.setDate(d7.getDate() - 7);
-      const rt = $('range-to');   if (rt) rt.value = now.toISOString().slice(0, 10);
-      const rf = $('range-from'); if (rf) rf.value = d7.toISOString().slice(0, 10);
-      const chip = $('chip-7');
-      if (chip) {
-        setRangeDays(7, chip);
+      // Default to All time so all data is visible immediately
+      const chipAll = $('chip-all');
+      if (chipAll) {
+        setRangeDays(0, chipAll);
       } else {
-        // Fallback: set state directly and render
-        const fromIso = d7.toISOString().slice(0, 10);
-        const toIso   = now.toISOString().slice(0, 10);
-        RANGE_START = fromIso; RANGE_END = toIso;
+        RANGE_START = null; RANGE_END = null;
         applyFilterAndRender();
       }
     } catch (e) {
@@ -820,7 +814,8 @@ html,body{font-family:'Inter',sans-serif;background:#fff;color:#0a0a0a;-webkit-f
       const e = new Date(RANGE_END);   e.setHours(23, 59, 59, 999);
       FILTERED = CUSTOMERS.map(c => {
         const items = c.items.filter(it => {
-          if (!it.added_at) return false;
+          // Items with no added_at date: always include them
+          if (!it.added_at) return true;
           const d = new Date(it.added_at);
           return d >= s && d <= e;
         });
