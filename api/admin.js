@@ -789,8 +789,14 @@ html,body{font-family:'Inter',sans-serif;background:#fff;color:#0a0a0a;-webkit-f
     } else {
       const now  = new Date();
       const from = new Date(now); from.setDate(from.getDate() - days);
-      RANGE_START = from.toISOString().slice(0, 10);
-      RANGE_END   = now.toISOString().slice(0, 10);
+      // Use local date (not UTC) so today is always included regardless of timezone
+      function toLocalDate(d) {
+        return d.getFullYear() + '-' +
+          String(d.getMonth() + 1).padStart(2, '0') + '-' +
+          String(d.getDate()).padStart(2, '0');
+      }
+      RANGE_START = toLocalDate(from);
+      RANGE_END   = toLocalDate(now);
       $('range-from').value = RANGE_START;
       $('range-to').value   = RANGE_END;
     }
@@ -812,6 +818,8 @@ html,body{font-family:'Inter',sans-serif;background:#fff;color:#0a0a0a;-webkit-f
     } else {
       const s = new Date(RANGE_START); s.setHours(0, 0, 0, 0);
       const e = new Date(RANGE_END);   e.setHours(23, 59, 59, 999);
+      // Add 1 day to end so IST users always see today's data (UTC offset fix)
+      e.setDate(e.getDate() + 1);
       FILTERED = CUSTOMERS.map(c => {
         const items = c.items.filter(it => {
           // Items with no added_at date: always include them
