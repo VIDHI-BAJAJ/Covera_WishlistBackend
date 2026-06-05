@@ -3,6 +3,7 @@
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;   // yourstore.myshopify.com
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const { sendToProvider } = require('../lib/whatsapp-provider');
 
 // Strip whitespace, newlines, and trailing slashes from origin to avoid header errors
 function cleanOrigin(value) {
@@ -114,9 +115,24 @@ async function addToWishlist(req, res) {
   const errors = data.metaobjectCreate.userErrors;
   if (errors.length) return res.status(400).json({ error: errors });
 
+  const created = data.metaobjectCreate.metaobject;
+
+  // Fire BOB webhook — non-blocking, wishlist save always succeeds
+  sendToProvider({
+    phone:          cleanPhone,
+    customer_name:  cleanName,
+    product_title:  product_title   || '',
+    product_handle: product_handle  || '',
+    variant_id:     String(variant_id || ''),
+    product_image:  product_image   || '',
+    product_price:  String(product_price || ''),
+  }).catch(err => {
+    console.error('[WhatsApp] Failed (wishlist still saved):', err.message);
+  });
+
   return res.status(201).json({
     success: true,
-    id: data.metaobjectCreate.metaobject.id,
+    id: created.id,
   });
 }
 
