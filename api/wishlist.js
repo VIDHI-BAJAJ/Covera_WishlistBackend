@@ -1,16 +1,15 @@
 // Shopify Wishlist API - Vercel Serverless Function
 // Stores wishlist entries as Shopify Metaobjects (visible in Shopify Admin)
 
+const { sendToProvider } = require('../lib/whatsapp-provider');
+
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;   // yourstore.myshopify.com
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
-const { sendToProvider } = require('../lib/whatsapp-provider');
 
 // Strip whitespace, newlines, and trailing slashes from origin to avoid header errors
 function cleanOrigin(value) {
   if (!value) return '*';
-  // Remove all whitespace (spaces, tabs, newlines, carriage returns)
   let s = String(value).replace(/\s+/g, '');
-  // Remove trailing slashes
   s = s.replace(/\/+$/, '');
   return s || '*';
 }
@@ -46,7 +45,7 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // Secret key validation (lightweight protection)
+  // Secret key validation
   if (API_SECRET && req.headers['x-wishlist-secret'] !== API_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -75,6 +74,12 @@ async function addToWishlist(req, res) {
 
   const cleanPhone = sanitizePhone(phone);
   const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanPhone);
+
+  // Skip BOB for email entries — WhatsApp needs a phone number
+  if (isEmail) {
+    console.log('[BOB] Skipping — identifier is email, not phone:', cleanPhone);
+  }
+
   if (!isEmail && cleanPhone.replace(/[^\d]/g, '').length < 7) {
     return res.status(400).json({ error: 'Invalid phone number or email' });
   }
@@ -87,6 +92,7 @@ async function addToWishlist(req, res) {
     return res.status(200).json({ success: true, alreadyExists: true, id: existingId });
   }
 
+  // Save to Shopify Metaobjects
   const data = await gql(
     `mutation CreateWishlistEntry($fields: [MetaobjectFieldInput!]!) {
        metaobjectCreate(metaobject: {
@@ -115,24 +121,20 @@ async function addToWishlist(req, res) {
   const errors = data.metaobjectCreate.userErrors;
   if (errors.length) return res.status(400).json({ error: errors });
 
-  const created = data.metaobjectCreate.metaobject;
-
-  // Fire BOB webhook — non-blocking, wishlist save always succeeds
-  sendToProvider({
-    phone:          cleanPhone,
-    customer_name:  cleanName,
-    product_title:  product_title   || '',
-    product_handle: product_handle  || '',
-    variant_id:     String(variant_id || ''),
-    product_image:  product_image   || '',
-    product_price:  String(product_price || ''),
-  }).catch(err => {
-    console.error('[WhatsApp] Failed (wishlist still saved):', err.message);
-  });
+  // Fire BOB batch trigger — only for phone numbers, not emails
+  if (!isEmail) {
+    scheduleOrUpdateBatch(cleanPhone, cleanName, {
+      product_title:  product_title   || '',
+      product_handle: product_handle  || '',
+      variant_id:     String(variant_id || ''),
+      product_image:  product_image   || '',
+      product_price:  String(product_price || ''),
+    });
+  }
 
   return res.status(201).json({
     success: true,
-    id: created.id,
+    id: data.metaobjectCreate.metaobject.id,
   });
 }
 
@@ -166,6 +168,62 @@ async function removeFromWishlist(req, res) {
   );
 
   return res.status(200).json({ success: true });
+}
+
+// ─── Batch sender ─────────────────────────────────────────────────────────────
+// Groups all products added within 10 minutes into a single WhatsApp message.
+// If customer adds 3 products quickly, they get 1 message listing all 3.
+
+const pendingBatches = {}; // phone → { timer, products, name }
+const BATCH_DELAY_MS = 10 * 60 * 1000; // 10 minutes
+
+function scheduleOrUpdateBatch(phone, name, productData) {
+  if (!pendingBatches[phone]) {
+    pendingBatches[phone] = { products: [], name, timer: null };
+  }
+
+  const batch = pendingBatches[phone];
+  batch.products.push(productData);
+  batch.name = name;
+
+  // Reset timer on every new product — always waits 10 mins from the LAST add
+  if (batch.timer) clearTimeout(batch.timer);
+
+  batch.timer = setTimeout(async () => {
+    const { products, name: customerName } = pendingBatches[phone];
+    delete pendingBatches[phone];
+
+    console.log(`[Batch] Firing for ${phone} — ${products.length} product(s)`);
+
+    const firstProduct = products[0];
+    const totalPrice   = products.reduce((sum, p) => sum + Number(p.product_price || 0), 0);
+
+    // Build product list string for multi-product messages
+    const productList = products.length === 1
+      ? firstProduct.product_title
+      : products.map((p, i) => `${i + 1}. ${p.product_title} — ₹${p.product_price}`).join('\n');
+
+    sendToProvider({
+      phone,
+      customer_name:  customerName,
+      product_title:  products.length === 1
+                        ? firstProduct.product_title
+                        : `${products.length} items`,
+      product_handle: firstProduct.product_handle,
+      variant_id:     firstProduct.variant_id,
+      product_image:  firstProduct.product_image,
+      product_price:  products.length === 1
+                        ? firstProduct.product_price
+                        : String(totalPrice),
+      product_list:   productList,
+      wishlist_count: String(products.length),
+    }).catch(err => {
+      console.error('[Batch] WhatsApp send failed:', err.message);
+    });
+
+  }, BATCH_DELAY_MS);
+
+  console.log(`[Batch] Queued for ${phone} — batch now has ${batch.products.length} product(s), timer reset`);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -213,16 +271,13 @@ async function findEntry(phone, product_id) {
 
 function sanitizePhone(phone) {
   const val = String(phone).trim();
-  // If it looks like an email, sanitize as email
   if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)) {
     return val.toLowerCase().substring(0, 100);
   }
-  // Otherwise sanitize as phone number
   return val.replace(/[^\d+\s\-()]/g, '').trim().substring(0, 20);
 }
 
 function sanitizeName(name) {
   if (!name) return '';
-  // Allow letters (incl. unicode), spaces, dots, hyphens, apostrophes; cap length
   return String(name).replace(/[<>{}|\\^`]/g, '').trim().substring(0, 80);
 }
