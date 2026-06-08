@@ -121,14 +121,22 @@ async function addToWishlist(req, res) {
   const errors = data.metaobjectCreate.userErrors;
   if (errors.length) return res.status(400).json({ error: errors });
 
-  // Fire BOB batch trigger — only for phone numbers, not emails
+  // Fire BOB immediately — only for phone numbers, not emails
+  // NOTE: setTimeout-based batching doesn't work on Vercel (serverless functions
+  // shut down after the response is sent, killing any pending timers).
   if (!isEmail) {
-    scheduleOrUpdateBatch(cleanPhone, cleanName, {
+    sendToProvider({
+      phone:          cleanPhone,
+      customer_name:  cleanName,
       product_title:  product_title   || '',
       product_handle: product_handle  || '',
       variant_id:     String(variant_id || ''),
       product_image:  product_image   || '',
       product_price:  String(product_price || ''),
+      product_list:   product_title   || '',
+      wishlist_count: '1',
+    }).catch(err => {
+      console.error('[WhatsApp] Send failed:', err.message);
     });
   }
 
@@ -168,62 +176,6 @@ async function removeFromWishlist(req, res) {
   );
 
   return res.status(200).json({ success: true });
-}
-
-// ─── Batch sender ─────────────────────────────────────────────────────────────
-// Groups all products added within 10 minutes into a single WhatsApp message.
-// If customer adds 3 products quickly, they get 1 message listing all 3.
-
-const pendingBatches = {}; // phone → { timer, products, name }
-const BATCH_DELAY_MS = 10 * 60 * 1000; // 10 minutes
-
-function scheduleOrUpdateBatch(phone, name, productData) {
-  if (!pendingBatches[phone]) {
-    pendingBatches[phone] = { products: [], name, timer: null };
-  }
-
-  const batch = pendingBatches[phone];
-  batch.products.push(productData);
-  batch.name = name;
-
-  // Reset timer on every new product — always waits 10 mins from the LAST add
-  if (batch.timer) clearTimeout(batch.timer);
-
-  batch.timer = setTimeout(async () => {
-    const { products, name: customerName } = pendingBatches[phone];
-    delete pendingBatches[phone];
-
-    console.log(`[Batch] Firing for ${phone} — ${products.length} product(s)`);
-
-    const firstProduct = products[0];
-    const totalPrice   = products.reduce((sum, p) => sum + Number(p.product_price || 0), 0);
-
-    // Build product list string for multi-product messages
-    const productList = products.length === 1
-      ? firstProduct.product_title
-      : products.map((p, i) => `${i + 1}. ${p.product_title} — ₹${p.product_price}`).join('\n');
-
-    sendToProvider({
-      phone,
-      customer_name:  customerName,
-      product_title:  products.length === 1
-                        ? firstProduct.product_title
-                        : `${products.length} items`,
-      product_handle: firstProduct.product_handle,
-      variant_id:     firstProduct.variant_id,
-      product_image:  firstProduct.product_image,
-      product_price:  products.length === 1
-                        ? firstProduct.product_price
-                        : String(totalPrice),
-      product_list:   productList,
-      wishlist_count: String(products.length),
-    }).catch(err => {
-      console.error('[Batch] WhatsApp send failed:', err.message);
-    });
-
-  }, BATCH_DELAY_MS);
-
-  console.log(`[Batch] Queued for ${phone} — batch now has ${batch.products.length} product(s), timer reset`);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
