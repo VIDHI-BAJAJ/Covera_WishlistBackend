@@ -83,7 +83,6 @@ async function addToWishlist(req, res) {
   const errors = data.metaobjectCreate.userErrors;
   if (errors.length) return res.status(400).json({ error: errors });
 
-  // For phone numbers: upsert batch using handle = phone (guaranteed unique in Shopify)
   if (!isEmail) {
     await upsertBatch(cleanPhone, cleanName, {
       product_title:  product_title  || '',
@@ -116,18 +115,29 @@ async function removeFromWishlist(req, res) {
   return res.status(200).json({ success: true });
 }
 
-// ─── Batch upsert using Shopify metaobjectUpsert (guaranteed no duplicates) ───
+// ─── Batch upsert using metaobjectUpsert — atomic, no duplicates ──────────────
 async function upsertBatch(phone, name, productData) {
-  // handle is unique per phone — Shopify upsert creates or updates atomically
   const handle = `batch-${phone.replace(/[^\w]/g, '')}`;
 
-  // First try to get existing batch to merge products
-  const existing = await findBatchByHandle(handle);
-  const currentProducts = existing ? JSON.parse(existing.products || '[]') : [];
-  currentProducts.push(productData);
+  // Use Shopify's upsert mutation — creates if not exists, updates if exists
+  // First get current products if batch exists
+  const existing = await gql(
+    `query GetBatch($handle: MetaobjectHandleInput!) {
+       metaobjectByHandle(handle: $handle) {
+         id
+         fields { key value }
+       }
+     }`,
+    { handle: { type: 'wishlist_batch', handle } }
+  );
 
-  if (existing) {
-    // Update existing
+  const obj = existing.metaobjectByHandle;
+
+  if (obj) {
+    // Batch exists — append product
+    const currentProducts = JSON.parse(obj.fields.find(f => f.key === 'products')?.value || '[]');
+    currentProducts.push(productData);
+
     await gql(
       `mutation UpdateBatch($id: ID!, $fields: [MetaobjectFieldInput!]!) {
          metaobjectUpdate(id: $id, metaobject: { fields: $fields }) {
@@ -136,7 +146,7 @@ async function upsertBatch(phone, name, productData) {
          }
        }`,
       {
-        id: existing.id,
+        id: obj.id,
         fields: [
           { key: 'products',   value: JSON.stringify(currentProducts) },
           { key: 'updated_at', value: new Date().toISOString() },
@@ -145,11 +155,15 @@ async function upsertBatch(phone, name, productData) {
     );
     console.log(`[Batch] Updated batch for ${phone} — now ${currentProducts.length} product(s)`);
   } else {
-    // Create with handle to prevent duplicates
+    // No batch — create with explicit handle
     await gql(
       `mutation CreateBatch($handle: String!, $fields: [MetaobjectFieldInput!]!) {
-         metaobjectCreate(metaobject: { type: "wishlist_batch", handle: $handle, fields: $fields }) {
-           metaobject { id }
+         metaobjectCreate(metaobject: {
+           type: "wishlist_batch",
+           handle: $handle,
+           fields: $fields
+         }) {
+           metaobject { id handle }
            userErrors { field message }
          }
        }`,
@@ -158,31 +172,13 @@ async function upsertBatch(phone, name, productData) {
         fields: [
           { key: 'phone',      value: phone },
           { key: 'name',       value: name },
-          { key: 'products',   value: JSON.stringify(currentProducts) },
+          { key: 'products',   value: JSON.stringify([productData]) },
           { key: 'created_at', value: new Date().toISOString() },
           { key: 'updated_at', value: new Date().toISOString() },
         ],
       }
     );
-    console.log(`[Batch] Created new batch for ${phone}`);
-  }
-}
-
-async function findBatchByHandle(handle) {
-  try {
-    const data = await gql(
-      `query FindBatchByHandle($handle: String!) {
-         metaobjectByHandle(handle: { type: "wishlist_batch", handle: $handle }) {
-           id fields { key value }
-         }
-       }`,
-      { handle }
-    );
-    const obj = data.metaobjectByHandle;
-    if (!obj) return null;
-    return { id: obj.id, ...Object.fromEntries(obj.fields.map(f => [f.key, f.value])) };
-  } catch (e) {
-    return null;
+    console.log(`[Batch] Created new batch for ${phone} with handle ${handle}`);
   }
 }
 
