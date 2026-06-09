@@ -1,12 +1,9 @@
 // Shopify Wishlist API - Vercel Serverless Function
 // Stores wishlist entries as Shopify Metaobjects (visible in Shopify Admin)
 
-const { sendToProvider } = require('../lib/whatsapp-provider');
-
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;   // yourstore.myshopify.com
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
-// Strip whitespace, newlines, and trailing slashes from origin to avoid header errors
 function cleanOrigin(value) {
   if (!value) return '*';
   let s = String(value).replace(/\s+/g, '');
@@ -14,7 +11,6 @@ function cleanOrigin(value) {
   return s || '*';
 }
 const ALLOWED_ORIGIN = cleanOrigin(process.env.ALLOWED_ORIGIN);
-
 const API_SECRET = process.env.WISHLIST_API_SECRET || '';
 
 // ─── Shopify GraphQL helper ───────────────────────────────────────────────────
@@ -45,7 +41,6 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // Secret key validation
   if (API_SECRET && req.headers['x-wishlist-secret'] !== API_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -75,24 +70,19 @@ async function addToWishlist(req, res) {
   const cleanPhone = sanitizePhone(phone);
   const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanPhone);
 
-  // Skip BOB for email entries — WhatsApp needs a phone number
-  if (isEmail) {
-    console.log('[BOB] Skipping — identifier is email, not phone:', cleanPhone);
-  }
-
   if (!isEmail && cleanPhone.replace(/[^\d]/g, '').length < 7) {
     return res.status(400).json({ error: 'Invalid phone number or email' });
   }
 
   const cleanName = sanitizeName(customer_name);
 
-  // Prevent duplicate entries
+  // Prevent duplicate wishlist entries
   const existingId = await findEntry(cleanPhone, String(product_id));
   if (existingId) {
     return res.status(200).json({ success: true, alreadyExists: true, id: existingId });
   }
 
-  // Save to Shopify Metaobjects
+  // Save to wishlist_entry metaobject
   const data = await gql(
     `mutation CreateWishlistEntry($fields: [MetaobjectFieldInput!]!) {
        metaobjectCreate(metaobject: {
@@ -105,15 +95,15 @@ async function addToWishlist(req, res) {
      }`,
     {
       fields: [
-        { key: 'phone',           value: cleanPhone },
-        { key: 'customer_name',   value: cleanName },
-        { key: 'product_id',      value: String(product_id) },
-        { key: 'product_title',   value: product_title   || '' },
-        { key: 'product_handle',  value: product_handle  || '' },
-        { key: 'variant_id',      value: String(variant_id || '') },
-        { key: 'product_image',   value: product_image   || '' },
-        { key: 'product_price',   value: String(product_price || '') },
-        { key: 'added_at',        value: new Date().toISOString() },
+        { key: 'phone',          value: cleanPhone },
+        { key: 'customer_name',  value: cleanName },
+        { key: 'product_id',     value: String(product_id) },
+        { key: 'product_title',  value: product_title  || '' },
+        { key: 'product_handle', value: product_handle || '' },
+        { key: 'variant_id',     value: String(variant_id || '') },
+        { key: 'product_image',  value: product_image  || '' },
+        { key: 'product_price',  value: String(product_price || '') },
+        { key: 'added_at',       value: new Date().toISOString() },
       ],
     }
   );
@@ -121,22 +111,14 @@ async function addToWishlist(req, res) {
   const errors = data.metaobjectCreate.userErrors;
   if (errors.length) return res.status(400).json({ error: errors });
 
-  // Fire BOB immediately — only for phone numbers, not emails
-  // NOTE: setTimeout-based batching doesn't work on Vercel (serverless functions
-  // shut down after the response is sent, killing any pending timers).
+  // For phone numbers: add to batch (cron will send 1 combined WhatsApp after 10 mins)
   if (!isEmail) {
-    sendToProvider({
-      phone:          cleanPhone,
-      customer_name:  cleanName,
-      product_title:  product_title   || '',
-      product_handle: product_handle  || '',
+    await upsertBatch(cleanPhone, cleanName, {
+      product_title:  product_title  || '',
+      product_handle: product_handle || '',
       variant_id:     String(variant_id || ''),
-      product_image:  product_image   || '',
+      product_image:  product_image  || '',
       product_price:  String(product_price || ''),
-      product_list:   product_title   || '',
-      wishlist_count: '1',
-    }).catch(err => {
-      console.error('[WhatsApp] Send failed:', err.message);
     });
   }
 
@@ -150,7 +132,6 @@ async function addToWishlist(req, res) {
 async function getWishlist(req, res) {
   const phone = req.query?.phone;
   if (!phone) return res.status(400).json({ error: 'phone query param is required' });
-
   const entries = await fetchEntriesByPhone(sanitizePhone(phone));
   return res.status(200).json({ wishlist: entries });
 }
@@ -161,21 +142,96 @@ async function removeFromWishlist(req, res) {
   if (!phone || !product_id) {
     return res.status(400).json({ error: 'phone and product_id are required' });
   }
-
   const id = await findEntry(sanitizePhone(phone), String(product_id));
   if (!id) return res.status(404).json({ error: 'Wishlist entry not found' });
 
   await gql(
     `mutation DeleteWishlistEntry($id: ID!) {
-       metaobjectDelete(id: $id) {
-         deletedId
-         userErrors { field message }
-       }
+       metaobjectDelete(id: $id) { deletedId userErrors { field message } }
      }`,
     { id }
   );
-
   return res.status(200).json({ success: true });
+}
+
+// ─── Batch upsert (create or append product to existing batch) ────────────────
+async function upsertBatch(phone, name, productData) {
+  // Check if a pending batch already exists for this phone
+  const existing = await findBatch(phone);
+
+  if (existing) {
+    // Append new product to existing batch
+    const currentProducts = JSON.parse(existing.products || '[]');
+    currentProducts.push(productData);
+
+    await gql(
+      `mutation UpdateBatch($id: ID!, $fields: [MetaobjectFieldInput!]!) {
+         metaobjectUpdate(id: $id, metaobject: { fields: $fields }) {
+           metaobject { id }
+           userErrors { field message }
+         }
+       }`,
+      {
+        id: existing.id,
+        fields: [
+          { key: 'products',    value: JSON.stringify(currentProducts) },
+          { key: 'updated_at',  value: new Date().toISOString() },
+        ],
+      }
+    );
+    console.log(`[Batch] Updated batch for ${phone} — now ${currentProducts.length} product(s)`);
+  } else {
+    // Create new batch
+    await gql(
+      `mutation CreateBatch($fields: [MetaobjectFieldInput!]!) {
+         metaobjectCreate(metaobject: {
+           type: "wishlist_batch",
+           fields: $fields
+         }) {
+           metaobject { id }
+           userErrors { field message }
+         }
+       }`,
+      {
+        fields: [
+          { key: 'phone',       value: phone },
+          { key: 'name',        value: name },
+          { key: 'products',    value: JSON.stringify([productData]) },
+          { key: 'created_at',  value: new Date().toISOString() },
+          { key: 'updated_at',  value: new Date().toISOString() },
+        ],
+      }
+    );
+    console.log(`[Batch] Created new batch for ${phone}`);
+  }
+}
+
+async function findBatch(phone) {
+  let cursor = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const data = await gql(
+      `query FindBatch($after: String) {
+         metaobjects(type: "wishlist_batch", first: 250, after: $after) {
+           nodes { id fields { key value } }
+           pageInfo { hasNextPage endCursor }
+         }
+       }`,
+      { after: cursor }
+    );
+    const { nodes, pageInfo } = data.metaobjects;
+    const match = nodes.find(n => n.fields.find(f => f.key === 'phone' && f.value === phone));
+    if (match) {
+      return {
+        id: match.id,
+        ...Object.fromEntries(match.fields.map(f => [f.key, f.value])),
+      };
+    }
+    hasNextPage = pageInfo.hasNextPage;
+    cursor = pageInfo.endCursor;
+  }
+  return null;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -188,16 +244,12 @@ async function fetchEntriesByPhone(phone) {
     const data = await gql(
       `query FetchWishlist($after: String) {
          metaobjects(type: "wishlist_entry", first: 250, after: $after) {
-           nodes {
-             id
-             fields { key value }
-           }
+           nodes { id fields { key value } }
            pageInfo { hasNextPage endCursor }
          }
        }`,
       { after: cursor }
     );
-
     const { nodes, pageInfo } = data.metaobjects;
     allNodes = allNodes.concat(nodes);
     hasNextPage = pageInfo.hasNextPage;
@@ -205,13 +257,10 @@ async function fetchEntriesByPhone(phone) {
   }
 
   return allNodes
-    .filter(node => {
-      const f = node.fields.find(x => x.key === 'phone');
-      return f && f.value === phone;
-    })
-    .map(node => ({
-      id: node.id,
-      ...Object.fromEntries(node.fields.map(f => [f.key, f.value])),
+    .filter(n => n.fields.find(f => f.key === 'phone' && f.value === phone))
+    .map(n => ({
+      id: n.id,
+      ...Object.fromEntries(n.fields.map(f => [f.key, f.value])),
     }));
 }
 
@@ -223,9 +272,7 @@ async function findEntry(phone, product_id) {
 
 function sanitizePhone(phone) {
   const val = String(phone).trim();
-  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)) {
-    return val.toLowerCase().substring(0, 100);
-  }
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)) return val.toLowerCase().substring(0, 100);
   return val.replace(/[^\d+\s\-()]/g, '').trim().substring(0, 20);
 }
 
