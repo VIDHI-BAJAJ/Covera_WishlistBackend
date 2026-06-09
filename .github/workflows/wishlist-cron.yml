@@ -1,0 +1,19 @@
+name: Wishlist Batch Cron
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'  # every 10 minutes
+  workflow_dispatch:         # allows manual trigger from GitHub Actions tab
+
+jobs:
+  process-batches:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger wishlist batch processing
+        run: |
+          curl -X GET "https://covera-wishlist-backend.vercel.app/api/cron" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --fail \
+            --silent \
+            --show-error
