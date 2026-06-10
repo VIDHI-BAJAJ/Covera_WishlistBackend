@@ -1,6 +1,4 @@
-// Vercel Cron Job — runs every 10 minutes
-// Reads all pending wishlist_batch metaobjects, sends 1 combined WhatsApp per customer, then deletes the batch
-
+// Vercel Cron Job — runs every 10 minutes via GitHub Actions
 const { sendToProvider } = require('../lib/whatsapp-provider');
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
@@ -12,10 +10,7 @@ async function gql(query, variables = {}) {
     `https://${SHOPIFY_STORE}/admin/api/2024-10/graphql.json`,
     {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': SHOPIFY_TOKEN,
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': SHOPIFY_TOKEN },
       body: JSON.stringify({ query, variables }),
     }
   );
@@ -26,16 +21,18 @@ async function gql(query, variables = {}) {
 }
 
 module.exports = async function handler(req, res) {
-  // Security: only allow Vercel cron or requests with CRON_SECRET header
-  const authHeader = req.headers['authorization'];
-  if (CRON_SECRET && authHeader !== `Bearer ${CRON_SECRET}`) {
+  // Allow Vercel cron (no auth header) OR requests with correct CRON_SECRET
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.replace('Bearer ', '').trim();
+
+  if (CRON_SECRET && token !== CRON_SECRET) {
+    console.log('[Cron] Auth failed. Received token:', token ? '***' : '(empty)');
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
   console.log('[Cron] Starting wishlist batch processing...');
 
   try {
-    // Fetch all pending batches
     const batches = await fetchAllBatches();
     console.log(`[Cron] Found ${batches.length} pending batch(es)`);
 
@@ -44,56 +41,39 @@ module.exports = async function handler(req, res) {
     for (const batch of batches) {
       const { id, phone, name, products: productsRaw, created_at } = batch;
 
-      // Only process batches older than 10 minutes (give customer time to add more products)
-      const createdAt = new Date(created_at);
-      const ageMinutes = (Date.now() - createdAt.getTime()) / 1000 / 60;
+      // Only process batches older than 10 minutes
+      const ageMinutes = (Date.now() - new Date(created_at).getTime()) / 1000 / 60;
       if (ageMinutes < 10) {
-        console.log(`[Cron] Skipping ${phone} — batch only ${ageMinutes.toFixed(1)} mins old`);
+        console.log(`[Cron] Skipping ${phone} — only ${ageMinutes.toFixed(1)} mins old`);
         continue;
       }
 
       let products = [];
       try { products = JSON.parse(productsRaw || '[]'); } catch (e) { products = []; }
-
-      if (!products.length) {
-        await deleteBatch(id);
-        continue;
-      }
-
-      const firstProduct = products[0];
-      const totalCount   = products.length;
-
-      // Build product list string for multi-product messages
-      const productList = products.length === 1
-        ? firstProduct.product_title
-        : products.map((p, i) => `${i + 1}. ${p.product_title} - Rs.${p.product_price}`).join('\n');
+      if (!products.length) { await deleteBatch(id); continue; }
 
       try {
         await sendToProvider({
           phone:          phone,
           customer_name:  name,
-          product_title:  products.length === 1
-                            ? firstProduct.product_title
-                            : `${totalCount} items`,
-          product_handle: firstProduct.product_handle,
-          variant_id:     firstProduct.variant_id,
-          product_image:  firstProduct.product_image,
-          product_price:  products.length === 1
-                            ? firstProduct.product_price
-                            : products.reduce((sum, p) => sum + Number(p.product_price || 0), 0).toString(),
-          product_list:   productList,
-          wishlist_count: String(totalCount),
+          // Simplified message — just wishlist count and link
+          product_title:  `${products.length} item${products.length > 1 ? 's' : ''}`,
+          product_handle: 'wishlist',
+          variant_id:     '',
+          product_image:  '',
+          product_price:  '',
+          product_list:   `You've added ${products.length} item${products.length > 1 ? 's' : ''} to your wishlist`,
+          wishlist_count: String(products.length),
+          wishlist_url:   'https://lovecovera.com/pages/wishlist',
         });
 
-        console.log(`[Cron] ✅ WhatsApp sent to ${phone} for ${totalCount} product(s)`);
-        results.push({ phone, products: totalCount, status: 'sent' });
-
-        // Delete batch after successful send
+        console.log(`[Cron] ✅ WhatsApp sent to ${phone} for ${products.length} product(s)`);
+        results.push({ phone, products: products.length, status: 'sent' });
         await deleteBatch(id);
 
       } catch (err) {
-        console.error(`[Cron] ❌ Failed to send to ${phone}:`, err.message);
-        results.push({ phone, products: totalCount, status: 'failed', error: err.message });
+        console.error(`[Cron] ❌ Failed for ${phone}:`, err.message);
+        results.push({ phone, products: products.length, status: 'failed', error: err.message });
       }
     }
 
@@ -106,10 +86,7 @@ module.exports = async function handler(req, res) {
 };
 
 async function fetchAllBatches() {
-  let allNodes = [];
-  let cursor = null;
-  let hasNextPage = true;
-
+  let allNodes = [], cursor = null, hasNextPage = true;
   while (hasNextPage) {
     const data = await gql(
       `query FetchBatches($after: String) {
@@ -125,18 +102,12 @@ async function fetchAllBatches() {
     hasNextPage = pageInfo.hasNextPage;
     cursor = pageInfo.endCursor;
   }
-
-  return allNodes.map(n => ({
-    id: n.id,
-    ...Object.fromEntries(n.fields.map(f => [f.key, f.value])),
-  }));
+  return allNodes.map(n => ({ id: n.id, ...Object.fromEntries(n.fields.map(f => [f.key, f.value])) }));
 }
 
 async function deleteBatch(id) {
   await gql(
-    `mutation DeleteBatch($id: ID!) {
-       metaobjectDelete(id: $id) { deletedId userErrors { field message } }
-     }`,
+    `mutation DeleteBatch($id: ID!) { metaobjectDelete(id: $id) { deletedId userErrors { field message } } }`,
     { id }
   );
   console.log(`[Cron] Deleted batch ${id}`);
