@@ -2,8 +2,8 @@ name: Wishlist Batch Cron
 
 on:
   schedule:
-    - cron: '*/10 * * * *'  # every 10 minutes
-  workflow_dispatch:         # allows manual trigger from GitHub Actions tab
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
 
 jobs:
   process-batches:
@@ -11,9 +11,32 @@ jobs:
     steps:
       - name: Trigger wishlist batch processing
         run: |
-          curl -X GET "https://covera-wishlist-backend.vercel.app/api/cron" \
+          RESPONSE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
+            -X GET "https://covera-wishlist-backend.vercel.app/api/cron" \
             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
-            -H "Content-Type: application/json" \
-            --fail \
-            --silent \
-            --show-error
+            -H "Content-Type: application/json")
+          echo "HTTP Status: $RESPONSE"
+          cat /tmp/response.txt
+          if [ "$RESPONSE" -ge 400 ]; then
+            echo "Cron failed with status $RESPONSE"
+            exit 1
+          fi
+          echo "Cron completed successfully"
+
+  keep-alive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Keep workflow alive
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          if [ "$(date +%u)" = "1" ] && [ "$(date +%H)" = "00" ]; then
+            echo "$(date)" >> .github/keep-alive.txt
+            git add .github/keep-alive.txt
+            git commit -m "chore: keep workflows alive [skip ci]" || echo "Nothing to commit"
+            git push || echo "Nothing to push"
+          fi
