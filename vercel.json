@@ -4,8 +4,16 @@
     {
       "source": "/api/(.*)",
       "headers": [
-        { "key": "X-Content-Type-Options", "value": "nosniff" }
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        }
       ]
     }
-  ]
+  ],
+  "functions": {
+    "api/sync-sheet.js": {
+      "maxDuration": 60
+    }
+  }
 }
