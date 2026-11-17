@@ -1,6 +1,5 @@
-
-
 // Shopify Wishlist API - Vercel Serverless Function
+const { appendRows, buildRow, detectDevice } = require('../lib/google-sheet');
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
@@ -94,6 +93,14 @@ async function addToWishlist(req, res) {
       product_price:  String(product_price || ''),
     });
   }
+
+  // Log to Google Sheet "Wishlist" tab (never blocks / fails the wishlist save)
+  try {
+    await appendRows([buildRow({
+      phone: cleanPhone, name: cleanName, product_id, product_title, product_handle, product_price,
+      page_url: req.headers['referer'] || '', device: detectDevice(req.headers['user-agent'] || ''),
+    })]);
+  } catch (e) { console.error('[Sheet] append failed:', e.message); }
 
   return res.status(201).json({ success: true, id: data.metaobjectCreate.metaobject.id });
 }
