@@ -45,8 +45,8 @@ module.exports = async function handler(req, res) {
     rows.forEach(r => { r.name = latestName[r.mobile] || ''; });
 
     let added = 0, skipped = 0;
-    for (let i = 0; i < rows.length; i += 500) {
-      const r = await appendRows(rows.slice(i, i + 500));
+    for (let i = 0; i < rows.length; i += 3000) {
+      const r = await appendRows(rows.slice(i, i + 3000));
       if (r) { added += r.added; skipped += r.skipped; }
     }
     return res.status(200).json({ total: rows.length, added, skipped });
