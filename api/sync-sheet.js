@@ -1,6 +1,7 @@
 // One-time backfill: copies ALL existing wishlist entries from Shopify into the "Wishlist" tab.
 // Call from browser:  https://YOUR-VERCEL-URL/api/sync-sheet?key=<SETUP_SECRET>
 // Safe to run more than once (Apps Script skips duplicates).
+// Rows are grouped by name + mobile in the sheet: one row per customer, all products + prices inside it.
 const { appendRows, buildRow } = require('../lib/google-sheet');
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
@@ -36,6 +37,13 @@ module.exports = async function handler(req, res) {
         phone: e.phone, name: e.customer_name, product_id: e.product_id, product_title: e.product_title,
         product_handle: e.product_handle, product_price: e.product_price, added_at: e.added_at,
       }));
+
+    // Same as the dashboard: one customer = one mobile, using the most recent non-empty name for it.
+    // (rows are oldest -> newest, so the last non-empty name wins)
+    const latestName = {};
+    rows.forEach(r => { if (r.name) latestName[r.mobile] = r.name; });
+    rows.forEach(r => { r.name = latestName[r.mobile] || ''; });
+
     let added = 0, skipped = 0;
     for (let i = 0; i < rows.length; i += 500) {
       const r = await appendRows(rows.slice(i, i + 500));
